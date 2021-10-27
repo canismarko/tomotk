@@ -1,14 +1,23 @@
+from functools import partial
 import datetime as dt
+import multiprocessing as mp
 import logging
 import math
 import enum
 from pathlib import Path
 from typing import Union
 
+from tqdm import tqdm
 import h5py
 import skimage
 import numpy as np
 from tomopy.misc.morph import downsample
+from scipy import ndimage
+from scipy.ndimage.measurements import center_of_mass
+import polarTransform
+from skimage.restoration import denoise_nl_means, estimate_sigma
+from skimage.filters import unsharp_mask, threshold_yen, threshold_otsu, threshold_li, threshold_triangle, rank
+from skimage.morphology import white_tophat, black_tophat, ball, disk, square, dilation, erosion, opening, closing
 
 from tomotk import exceptions
 
@@ -29,7 +38,7 @@ class Labels(enum.IntEnum):
 
 def label_cylinder(hdf_uri: Uri, src_ds: str="volume", dest_ds: str="volume_labels", overwrite: bool=False):
     """Calculate labels for a volume stored in an HDF5 file.
-
+    
     hdf_uri
       The HDF5 file to open.
     src_ds
@@ -65,6 +74,45 @@ def label_cylinder(hdf_uri: Uri, src_ds: str="volume", dest_ds: str="volume_labe
     # Log to time it took to label this tomogram
     delta = dt.datetime.now() - start
     log.info(f"Labeled '{hdf_uri}:{src_ds}' in {str(delta)}.")
+
+
+def polar_hull(slc):
+    """Find the largest convex region using a polar transform."""
+    old_dtype = slc.dtype
+    # Convert to polar coordinates
+    slc = slc.astype('uint8') * 256
+    center = center_of_mass(slc)
+    center_is_valid = not np.any(np.isnan(center))
+    if not center_is_valid:
+        log.warning("Unvalid center by center of mass method. "
+                    "Defaulting to center of image")
+        center = None
+    log.debug("Performing polar transform")
+    pim, ptSettings = polarTransform.convertToPolarImage(slc, center=center)
+    log.debug("Applying anisotropic morphology filters to polar image.")
+    pim = pim.astype('bool')
+    pim = ndimage.median_filter(pim, size=9)
+    pim = closing(pim, selem=np.ones((10, 1)))
+    pim = opening(pim, selem=np.ones((1, 10)))
+    # Mesh grid in order to compare edge positions
+    my, mx = np.mgrid[:pim.shape[0],:pim.shape[1]]
+    # Find the outside of the shape in the x direction
+    log.debug("Calculating hull boundary")
+    edge_r_idx = pim.shape[1] - np.argmax(pim[:,::-1], axis=1)
+    edge_r_idx[edge_r_idx==pim.shape[1]] = 0
+    edge_r = mx < edge_r_idx[:,np.newaxis]
+    edge_r = ndimage.median_filter(edge_r, size=9)
+    log.debug("Performing inverse polar transform")
+    hull, uptSetting = polarTransform.convertToCartesianImage(edge_r.astype('uint8')*256, settings=ptSettings)
+    return hull.astype(old_dtype)
+
+
+def _label_pores_slice(slc_fg, dtype="uint8"):
+    # Agressive denoise and sharpening
+    sigma_est = np.mean(estimate_sigma(slc_fg))
+    electrode = polar_hull(slc_fg)
+    pores = np.logical_and(~slc_fg, electrode)
+    return pores.astype(dtype)
 
 
 class CylinderLabeler():
@@ -135,7 +183,41 @@ class CylinderLabeler():
         # 3D labeling does not work well for finding free lead, so let's do that by 2D thresholding
         free_lead = self.label_lead_2d(vol, labels)
         labels[free_lead] = Labels.FREE_LEAD
+        # Now isolate the pores from the regular background
+        pores = self.label_pores(labels > Labels.BACKGROUND)
+        log.debug("Highlighting pores in labels volume.")
+        pores = pores.astype('bool', copy=False)
+        labels[pores] = Labels.PORE
+        log.debug("End of CylinderLabeler.label()")
         return labels
+
+    def label_pores(self, vol_fg):
+        """Label the internal pores within the electrode.
+        
+        Parameters
+        ==========
+        vol_fg : ndarray
+          A 3D array where non-zero values are the foreground
+          (i.e. active material/free-lead/etc)
+        
+        Returns
+        =======
+        pores : ndarray
+          A 3D array with shape of *vol_fg*, where nonzero values
+          correspond to pores within the electrode.
+        
+        """
+        desc = "Extracting pores"
+        out = np.zeros_like(vol_fg, dtype="uint8")
+        label_f = partial(_label_pores_slice, dtype=out.dtype)
+        ncore = max(mp.cpu_count()-2, 1)
+        log.debug(f"Starting pore labeling with {ncore} cores...")
+        with mp.Pool(ncore) as p:
+            map_it = p.imap(label_f, vol_fg, chunksize=32)
+            for slc_idx, label_slc in enumerate(tqdm(map_it, total=vol_fg.shape[0], desc=desc, unit="slc")):
+                out[slc_idx] = label_slc
+        log.debug(f"Finished labeling pores")
+        return out
     
     def label_lead_2d(self, vol, labels):
         """Use 2D thresholding to try and identify free lead.
@@ -166,7 +248,7 @@ class CylinderLabeler():
         radii[radii > 1] = 1
         # Do labeling for each slice
         lead_labels = []
-        for idx, (slc, lbl) in enumerate(zip(vol, labels)):
+        for idx, (slc, lbl) in enumerate(tqdm(zip(vol, labels), total=vol.shape[0], desc="Labeling free lead", unit="slc")):
             th_low, th_high = skimage.filters.threshold_multiotsu(slc, classes=3)
             slc_lead = (slc > th_high).astype('float32')
             lbl = (lbl == Labels.FREE_LEAD).astype('float32')
@@ -269,3 +351,4 @@ class CylinderLabeler():
         labels[vol >= self.lead_threshold] = Labels.FREE_LEAD
         labels[vol < self.bg_threshold] = Labels.BACKGROUND
         return labels
+    
